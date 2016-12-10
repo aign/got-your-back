@@ -13,6 +13,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from requests.api import options
 
 """\n%s\n\nGot Your Back (GYB) is a command line tool which allows users to
 backup and restore their Gmail.
@@ -64,6 +65,17 @@ import oauth2client.tools
 import googleapiclient
 import googleapiclient.discovery
 import googleapiclient.errors
+import psycopg2
+from psycopg2.extensions import AsIs
+
+db_config = {
+ "host": "", 
+ "port": "", 
+ "dbname": "",
+ "user": "",
+ "password": ""
+}
+
 
 if os.name == 'windows' or os.name == 'nt':
   path_divider = '\\'
@@ -183,6 +195,12 @@ method breaks Gmail deduplication and threading.')
   parser.add_argument('--help',
     action='help',
     help='Display this message.')
+  parser.add_argument('--pg',
+    action='store_true',
+    dest = 'pg_db',
+    default=False,
+    help='Use postgresql instead of sqlite db')
+  
   return parser.parse_args(argv)
 
 def getProgPath():
@@ -567,36 +585,65 @@ def callGAPIpages(service, function, items='items',
       return all_pages
 
 def message_is_backed_up(message_num, sqlcur, sqlconn, backup_folder):
-    try:
-      sqlcur.execute('''
-         SELECT message_filename FROM uids NATURAL JOIN messages
-                where uid = ?''', ((message_num),))
-    except sqlite3.OperationalError as e:
-      if e.message == 'no such table: messages':
-        print("\n\nError: your backup database file appears to be corrupted.")
-      else:
-        print("SQL error:%s" % e)
-      sys.exit(8)
-    sqlresults = sqlcur.fetchall()
-    for x in sqlresults:
-      filename = x[0]
-      if os.path.isfile(os.path.join(backup_folder, filename)):
-        return True
-    return False
+    if not options.pg_db:
+      try:
+        sqlcur.execute('''SELECT message_filename FROM uids NATURAL JOIN messages where uid = ?''', ((message_num),))
+      except sqlite3.OperationalError as e:
+        if e.message == 'no such table: messages':
+          print("\n\nError: your backup database file appears to be corrupted.")
+        else:
+          print("SQL error:%s" % e)
+        sys.exit(8)
+      sqlresults = sqlcur.fetchall()
+      for x in sqlresults:
+        filename = x[0]
+        if os.path.isfile(os.path.join(backup_folder, filename)):
+          return True
+      return False
+    else:
+      try:
+        rewrite_line(message_num)  
+        pgcur.execute('''SELECT message_filename FROM "%s".uids NATURAL JOIN "%s".messages where uid = %s''', (AsIs("gyb_emails"),AsIs("gyb_emails"),(message_num)))
+      except sqlite3.OperationalError as e:
+        if e.message == 'no such table: messages':
+          print("\n\nError: your backup database file appears to be corrupted.")
+        else:
+          print("SQL error:%s" % e)
+        sys.exit(8)
+      sqlresults = sqlcur.fetchall()
+      for x in sqlresults:
+        filename = x[0]
+        if os.path.isfile(os.path.join(backup_folder, filename)):
+          return True
+      return False
+
 
 def get_db_settings(sqlcur):
-  try:
-    sqlcur.execute('SELECT name, value FROM settings')
-    db_settings = dict(sqlcur) 
-    return db_settings
-  except sqlite3.OperationalError as e:
-    if e.message == 'no such table: settings':
-      print("\n\nSorry, this version of GYB requires version %s of the \
-database schema. Your backup folder database does not have a version."
- % (__db_schema_version__))
-      sys.exit(6)
-    else: 
-      print("%s" % e)
+  if not options.pg_db:
+    try:
+      sqlcur.execute('SELECT name, value FROM settings')
+      db_settings = dict(sqlcur) 
+      return db_settings
+    except sqlite3.OperationalError as e:
+      if e.message == 'no such table: settings':
+        print("\n\nSorry, this version of GYB requires version %s of the \
+              database schema. Your backup folder database does not have a version." % (__db_schema_version__))
+        sys.exit(6)
+      else: 
+        print("%s" % e)
+  else:
+    try:
+      pgcur.execute('SELECT name, value FROM "%s".settings',(AsIs("gyb_emails"),))
+      db_settings = dict(sqlcur) 
+      return db_settings
+    except psycopg2.Error as e:
+      if e.message == 'no such table: settings':
+        print("\n\nSorry, this version of GYB requires version %s of the \
+              database schema. Your backup folder database does not have a version." % (__db_schema_version__))
+        sys.exit(6)
+      else: 
+        print("%s" % e)
+
 
 def check_db_settings(db_settings, action, user_email_address):
   if (db_settings['db_version'] < __db_schema_min_version__  or
@@ -611,6 +658,8 @@ __db_schema_version__))
   # account (can't allow 2 Google Accounts to backup/estimate from same folder)
   if action not in ['restore', 'restore-group', 'restore-mbox']:
     if user_email_address.lower() != db_settings['email_address'].lower():
+      print (user_email_address.lower()) 
+      print(db_settings['email_address'].lower())
       print("\n\nSorry, this backup folder should only be used with the %s \
 account that it was created with for incremental backups. You specified the\
  %s account" % (db_settings['email_address'], user_email_address))
@@ -710,9 +759,10 @@ def rewrite_line(mystring):
 
 def initializeDB(sqlcur, sqlconn, email):
   sqlcur.executescript('''
-   CREATE TABLE messages(message_num INTEGER PRIMARY KEY, 
+   CREATE TABLE messages( message_num INTEGER PRIMARY KEY, 
                          message_filename TEXT, 
-                         message_internaldate TIMESTAMP);
+                         message_internaldate TIMESTAMP,
+                         email_address TEXT);
    CREATE TABLE labels (message_num INTEGER, label TEXT);
    CREATE TABLE uids (message_num INTEGER, uid TEXT PRIMARY KEY);
    CREATE TABLE settings (name TEXT PRIMARY KEY, value TEXT);
@@ -722,6 +772,61 @@ def initializeDB(sqlcur, sqlconn, email):
          (('email_address', email),
           ('db_version', __db_schema_version__)))
   sqlconn.commit()
+
+
+def initializePGDB(pgcur, pgconn, email):
+  print("CREATING SCHEMA")
+  query = """CREATE SCHEMA IF NOT EXISTS "%s" AUTHORIZATION %s;GRANT ALL ON SCHEMA gyb_emails TO PUBLIC;"""
+  param = (AsIs(email),AsIs(pguser))
+  pgcur.execute(query,param)
+  query ="""
+    CREATE TABLE IF NOT EXISTS "%s".labels(message_num integer,label text) WITH (OIDS=FALSE);
+    ALTER TABLE "%s".labels OWNER TO %s;"""
+  param =(AsIs(email),AsIs(email),AsIs(pguser))
+  pgcur.execute(query,param)
+
+  query ="""CREATE TABLE IF NOT EXISTS "%s".messages(
+            message_filename text,
+            message_internaldate timestamp without time zone,
+            rfc822_msgid text,
+            message_num SERIAL,
+            ATTACHMENT_PROCESSED text,
+            email_address TEXT)
+          WITH (OIDS=FALSE);
+          ALTER TABLE "%s".messages OWNER TO %s;
+GRANT ALL ON TABLE "%s".messages  TO PUBLIC;"""
+  param = (AsIs(email),AsIs(email),AsIs(pguser), AsIs(email))
+  pgcur.execute(query,param)
+
+  query ="""CREATE TABLE IF NOT EXISTS "%s".restored_messages(
+            message_num integer NOT NULL,
+            CONSTRAINT "PK_message_num" PRIMARY KEY (message_num))
+          WITH (OIDS=FALSE);
+          ALTER TABLE "%s".restored_messages OWNER TO %s;"""
+  param = (AsIs(email),AsIs(email),AsIs(pguser))
+  pgcur.execute(query,param)
+
+  query ="""CREATE TABLE IF NOT EXISTS "%s".settings(
+            name text NOT NULL,
+            value text,
+            CONSTRAINT "PK_settings" PRIMARY KEY (name))
+          WITH (OIDS=FALSE);
+          ALTER TABLE "%s".settings OWNER TO %s;"""
+  param = (AsIs(email),AsIs(email),AsIs(pguser))
+  pgcur.execute(query,param)
+
+
+  query ="""CREATE TABLE IF NOT EXISTS "%s".uids(
+            message_num integer,
+            uid text NOT NULL,
+          CONSTRAINT "PK_uids" PRIMARY KEY (uid))
+          WITH (OIDS=FALSE);
+          ALTER TABLE "%s".uids OWNER TO %s;"""
+  param = (AsIs(email),AsIs(email),AsIs(pguser))
+  pgcur.execute(query,param)
+#  pgcur.execute('''INSERT INTO "%s".settings (name, value) VALUES ('email_address', %s)''', (AsIs(email), options.email))
+#  pgcur.execute('''INSERT INTO "%s".settings (name, value) VALUES ('db_version', %s)''', (AsIs(email), __db_schema_version__))          
+  pgconn.commit()  
 
 def getGYBVersion(divider="\n"):
   return ('Got Your Back %s~DIV~%s~DIV~%s - %s~DIV~Python %s.%s.%s %s-bit \
@@ -796,19 +901,35 @@ def refresh_message(request_id, response, exception):
   else:
     if 'labelIds' in response:
       labels = labelIdsToLabels(response['labelIds'])
-      sqlcur.execute('DELETE FROM current_labels')
-      sqlcur.executemany(
-           'INSERT INTO current_labels (label) VALUES (?)',
-              ((label,) for label in labels))
-      sqlcur.execute("""DELETE FROM labels where message_num = 
-                   (SELECT message_num from uids where uid = ?)
-                    AND label NOT IN current_labels""", ((response['id']),))
-      sqlcur.execute("""INSERT INTO labels (message_num, label) 
-            SELECT message_num, label from uids, current_labels 
-               WHERE uid = ? AND label NOT IN 
-               (SELECT label FROM labels 
-                  WHERE message_num = uids.message_num)""",
-                  ((response['id']),))
+      if not options.pg_db:
+        sqlcur.execute('DELETE FROM current_labels')
+        sqlcur.executemany(
+             'INSERT INTO current_labels (label) VALUES (?)',
+                ((label,) for label in labels))
+        sqlcur.execute("""DELETE FROM labels where message_num = 
+                     (SELECT message_num from uids where uid = ?)
+                      AND label NOT IN current_labels""", ((response['id']),))
+        sqlcur.execute("""INSERT INTO labels (message_num, label) 
+              SELECT message_num, label from uids, current_labels 
+                 WHERE uid = ? AND label NOT IN 
+                 (SELECT label FROM labels 
+                    WHERE message_num = uids.message_num)""",
+                    ((response['id']),))
+      else:
+        pgcur.execute('DELETE FROM current_labels')
+        pgcur.executemany(
+             'INSERT INTO current_labels (label) VALUES (%s)',
+                ((label,) for label in labels))
+        pgcur.execute("""DELETE FROM "%s".labels where message_num = 
+                     (SELECT message_num from "%s".uids where uid = %s)
+                      AND label NOT IN (select label from current_labels)""", (AsIs("gyb_emails"),AsIs("gyb_emails"),(response['id'])))
+        pgcur.execute("""INSERT INTO "%s".labels (message_num, label) 
+              SELECT message_num, label from "%s".uids, current_labels 
+                 WHERE uid = %s AND label NOT IN 
+                 (SELECT label FROM "%s".labels 
+                    WHERE message_num = "%s".uids.message_num)""",
+                    (AsIs("gyb_emails"),AsIs("gyb_emails"),(response['id']),AsIs("gyb_emails"),AsIs("gyb_emails") ))
+
 
 def restored_message(request_id, response, exception):
   if exception is not None:
@@ -822,9 +943,14 @@ def restored_message(request_id, response, exception):
       pass
     raise exception
   else:
-    sqlconn.execute(
-      '''INSERT OR IGNORE INTO restored_messages (message_num) VALUES (?)''',
-      (request_id,))
+    if not options.pg_db:
+      sqlcur.execute(
+        '''INSERT OR IGNORE INTO restored_messages (message_num) VALUES (?)''',
+        (request_id,))
+    else:
+      pgcur.execute(
+        '''INSERT INTO "%s".restored_messages (message_num) VALUES (%s) ON CONFLICT DO NOTHING''',
+        (AsIs("gyb_emails"),request_id))
 
 def purged_message(request_id, response, exception):
   if exception is not None:
@@ -869,20 +995,41 @@ def backup_message(request_id, response, exception):
     full_message = base64.urlsafe_b64decode(raw_message)
     f.write(full_message)
     f.close()
-    sqlcur.execute("""
-             INSERT INTO messages (
-                         message_filename, 
-                         message_internaldate) VALUES (?, ?)""",
-                        (message_rel_filename,
-                         time_for_sqlite))
-    message_num = sqlcur.lastrowid
-    sqlcur.execute("""
-             REPLACE INTO uids (message_num, uid) VALUES (?, ?)""",
-                               (message_num, response['id']))
-    for label in labels:
+    if not options.pg_db:
       sqlcur.execute("""
-           INSERT INTO labels (message_num, label) VALUES (?, ?)""",
-                              (message_num, label))
+               INSERT INTO messages (
+                           message_filename, 
+                           message_internaldate) VALUES (?, ?)""",
+                          (message_rel_filename,
+                           time_for_sqlite))
+      message_num = sqlcur.lastrowid
+      
+      sqlcur.execute("""
+               REPLACE INTO uids (message_num, uid) VALUES (?, ?)""",
+                                 (message_num, response['id']))
+      for label in labels:
+        sqlcur.execute("""
+             INSERT INTO labels (message_num, label) VALUES (?, ?)""",
+                                (message_num, label))
+    else:
+      pgcur.execute("""
+               INSERT INTO "%s".messages (
+                           message_filename, 
+                           message_internaldate, email_address) VALUES (%s, %s ,%s) RETURNING message_num""",
+                          (AsIs("gyb_emails"),message_rel_filename,time_for_sqlite , options.email) )
+      message_num = pgcur.fetchone()[0]
+   
+      pgcur.execute("""
+               UPDATE "%s".uids set uid = %s where message_num = %s """,
+                                 (AsIs("gyb_emails"),response['id'],message_num))
+
+      pgcur.execute("""
+               INSERT INTO "%s".uids (message_num, uid) VALUES (%s, %s) ON CONFLICT DO NOTHING""",
+                                 (AsIs("gyb_emails"),message_num, response['id']))
+      for label in labels:
+        pgcur.execute("""
+             INSERT INTO "%s".labels (message_num, label) VALUES (%s, %s)""",
+                                (AsIs("gyb_emails"),message_num, label))
 
 def bytes_to_larger(myval):
   myval = int(myval)
@@ -977,8 +1124,26 @@ def main(argv):
 
   sqldbfile = os.path.join(options.local_folder, 'msg-db.sqlite')
   # Do we need to initialize a new database?
-  newDB = (not os.path.isfile(sqldbfile)) and \
-    (options.action in ['backup', 'restore-mbox'])
+  if not options.pg_db:
+    newDB = (not os.path.isfile(sqldbfile)) and \
+      (options.action in ['backup', 'restore-mbox'])
+  else:
+    global pgconn
+    global pgcur
+    global pguser 
+    pguser = db_config['user']
+    pgconn = psycopg2.connect(" ".join("{0}='{1}'".format(k,v) for k,v in db_config.items()))
+    pgcur = pgconn.cursor()
+    
+    pgcur.execute('''SELECT count(schema_name)=0 as newDB FROM information_schema.schemata WHERE schema_name = %s''',("gyb_emails",))
+    rows = pgcur.fetchall()
+    if (rows[0][0]==False):
+      pgcur.execute('''SELECT count(message_num)=0 as newDB FROM gyb_emails.messages WHERE email_address = %s''',(options.email,))
+      rows = pgcur.fetchall()
+      for record in rows:
+        newDB=record[0]
+    else:
+      newDB = True  
   
   # If we're not doing a estimate or if the db file actually exists we open it
   # (creates db if it doesn't exist)
@@ -986,25 +1151,40 @@ def main(argv):
     'quota', 'revoke']:
     if options.action not in ['estimate'] or os.path.isfile(sqldbfile):
       print("\nUsing backup folder %s" % options.local_folder)
-      global sqlconn
-      global sqlcur
-      sqlconn = sqlite3.connect(sqldbfile,
-        detect_types=sqlite3.PARSE_DECLTYPES)
-      sqlconn.text_factory = str
-      sqlcur = sqlconn.cursor()
-      if newDB:
-        initializeDB(sqlcur, sqlconn, options.email)
-      db_settings = get_db_settings(sqlcur)
-      check_db_settings(db_settings, options.action, options.email)
-      if options.action not in ['restore', 'restore-group', 'restore-mbox']:
-        if db_settings['db_version'] <  __db_schema_version__:
-          convertDB(sqlconn, db_settings['db_version'])
-          db_settings = get_db_settings(sqlcur)
-        if options.action == 'reindex':
-          getMessageIDs(sqlconn, options.local_folder)
-          rebuildUIDTable(sqlconn)
-          sqlconn.commit()
-          sys.exit(0)
+      if (not options.pg_db):
+        global sqlconn
+        global sqlcur
+        sqlconn = sqlite3.connect(sqldbfile,
+          detect_types=sqlite3.PARSE_DECLTYPES)
+        sqlconn.text_factory = str
+        sqlcur = sqlconn.cursor()
+        if newDB:
+          initializeDB(sqlcur, sqlconn, options.email)
+        db_settings = get_db_settings(sqlcur)
+        check_db_settings(db_settings, options.action, options.email)
+        if options.action not in ['restore', 'restore-group', 'restore-mbox']:
+          if db_settings['db_version'] <  __db_schema_version__:
+            convertDB(sqlconn, db_settings['db_version'])
+            db_settings = get_db_settings(sqlcur)
+          if options.action == 'reindex':
+            getMessageIDs(sqlconn, options.local_folder)
+            rebuildUIDTable(sqlconn)
+            sqlconn.commit()
+            sys.exit(0)
+      else:
+        if newDB:
+          print("NEW DB")  
+          initializePGDB(pgcur,pgconn,"gyb_emails")
+        #if newDB:
+          #initializeDB(sqlcur, sqlconn, options.email)
+        db_settings = get_db_settings(pgcur)
+        #check_db_settings(db_settings, options.action, options.email)
+        if options.action not in ['restore', 'restore-group', 'restore-mbox']:
+          if options.action == 'reindex':
+            getMessageIDs(pgconn, options.local_folder)
+            rebuildUIDTable(pgconn)
+            pgconn.commit()
+            sys.exit(0)
 
   # BACKUP #
   if options.action == 'backup':
@@ -1022,12 +1202,19 @@ def main(argv):
     messages_to_refresh = []
     #Determine which messages from the search we haven't processed before.
     print("GYB needs to examine %s messages" % len(messages_to_process))
+
     for message_num in messages_to_process:
-      if not newDB and message_is_backed_up(message_num['id'], sqlcur, sqlconn,
-        options.local_folder):
-        messages_to_refresh.append(message_num['id'])
+      if not options.pg_db:  
+        if not newDB and message_is_backed_up(message_num['id'], sqlcur, sqlconn,options.local_folder):
+          messages_to_refresh.append(message_num['id'])
+        else:
+          messages_to_backup.append(message_num['id'])
       else:
-        messages_to_backup.append(message_num['id'])
+        if not newDB and message_is_backed_up(message_num['id'], pgcur, pgconn,options.local_folder):
+          messages_to_refresh.append(message_num['id'])
+        else:
+          messages_to_backup.append(message_num['id'])
+          
     print("GYB already has a backup of %s messages" %
       (len(messages_to_process) - len(messages_to_backup)))
     backup_count = len(messages_to_backup)
@@ -1043,12 +1230,18 @@ def main(argv):
       if len(gbatch._order) == options.batch_size:
         callGAPI(gbatch, None, soft_errors=True)
         gbatch = googleapiclient.http.BatchHttpRequest()
-        sqlconn.commit()
+        if not options.pg_db:
+          sqlconn.commit()
+        else:
+          pgconn.commit()
         rewrite_line("backed up %s of %s messages" %
           (backed_up_messages, backup_count))
     if len(gbatch._order) > 0:
       callGAPI(gbatch, None, soft_errors=True)
-      sqlconn.commit()
+      if not options.pg_db:
+        sqlconn.commit()
+      else:
+        pgconn.commit()
       rewrite_line("backed up %s of %s messages" %
         (backed_up_messages, backup_count))
     print("\n")
@@ -1058,9 +1251,14 @@ def main(argv):
     refreshed_messages = 0
     refresh_count = len(messages_to_refresh)
     print("GYB needs to refresh %s messages" % refresh_count)
-    sqlcur.executescript("""
-       CREATE TEMP TABLE current_labels (label TEXT);
-    """)
+    if not options.pg_db: 
+      sqlcur.execute("""
+        CREATE TEMP TABLE current_labels (label TEXT);
+      """)
+    else:
+      pgcur.execute("""
+        CREATE TEMP TABLE current_labels (label TEXT);
+      """)
     gbatch = googleapiclient.http.BatchHttpRequest()
     for a_message in messages_to_refresh:
       gbatch.add(gmail.users().messages().get(userId='me',
@@ -1071,12 +1269,18 @@ def main(argv):
       if len(gbatch._order) == options.batch_size:
         callGAPI(gbatch, None, soft_errors=True)
         gbatch = googleapiclient.http.BatchHttpRequest()
-        sqlconn.commit()
+        if not options.pg_db:
+          sqlconn.commit()
+        else:
+          pgconn.commit()
         rewrite_line("refreshed %s of %s messages" %
           (refreshed_messages, refresh_count))
     if len(gbatch._order) > 0:
       callGAPI(gbatch, None, soft_errors=True)
-      sqlconn.commit()
+      if not options.pg_db:
+        sqlconn.commit()
+      else:
+        pgconn.commit()
       rewrite_line("refreshed %s of %s messages" %
         (refreshed_messages, refresh_count))
     print("\n")
@@ -1094,17 +1298,30 @@ def main(argv):
         pass
       except IOError:
         pass
-    sqlcur.execute('ATTACH ? as resume', (resumedb,))
-    sqlcur.executescript('''CREATE TABLE IF NOT EXISTS resume.restored_messages 
-                        (message_num INTEGER PRIMARY KEY); 
+    if not options.pg_db:
+      sqlcur.execute('ATTACH ? as resume', (resumedb,))
+      sqlcur.executescript('''CREATE TABLE IF NOT EXISTS resume.restored_messages 
+                        (message_num SERIAL PRIMARY KEY); 
                         CREATE TEMP TABLE skip_messages (message_num INTEGER \
                           PRIMARY KEY);''')
-    sqlcur.execute('''INSERT INTO skip_messages SELECT message_num from \
-      restored_messages''')
-    sqlcur.execute('''SELECT message_num, message_internaldate, \
-      message_filename FROM messages
+      sqlcur.execute('''INSERT INTO skip_messages SELECT message_num from \
+        restored_messages''')
+      sqlcur.execute('''SELECT message_num, message_internaldate, \
+        message_filename FROM messages
                       WHERE message_num NOT IN skip_messages ORDER BY \
                       message_internaldate DESC''') # All messages
+    else:
+      
+      pgcur.execute('''CREATE TABLE IF NOT EXISTS "%s".restored_messages 
+                        (message_num INTEGER PRIMARY KEY); 
+                        CREATE TEMP TABLE skip_messages (message_num INTEGER \
+                          PRIMARY KEY);''',(AsIs("gyb_emails"),))
+      pgcur.execute('''INSERT INTO skip_messages SELECT message_num from \
+        "%s".restored_messages''',(AsIs("gyb_emails"),))
+      pgcur.execute('''SELECT message_num, message_internaldate, \
+        message_filename FROM "%s".messages
+                      WHERE message_num NOT IN (select message_num from skip_messages) ORDER BY \
+                      message_internaldate DESC''',(AsIs("gyb_emails"),)) # All messages
 
     restore_serv = gmail.users().messages()
     if options.fast_restore:
@@ -1114,7 +1331,10 @@ def main(argv):
       restore_func = 'import_'
       restore_params = {'neverMarkSpam': True}
     restore_method = getattr(restore_serv, restore_func)
-    messages_to_restore_results = sqlcur.fetchall()
+    if not options.pg_db:
+        messages_to_restore_results = sqlcur.fetchall()
+    else:
+        messages_to_restore_results = pgcur.fetchall()
     restore_count = len(messages_to_restore_results)
     current = 0
     gbatch = googleapiclient.http.BatchHttpRequest()
@@ -1137,9 +1357,12 @@ def main(argv):
       f.close()
       labels = []
       if not options.strip_labels:
-        sqlcur.execute('SELECT DISTINCT label FROM labels WHERE message_num \
-          = ?', (message_num,))
-        labels_results = sqlcur.fetchall()
+        if not options.pg_db:
+          sqlcur.execute('SELECT DISTINCT label FROM labels WHERE message_num = ?', (message_num,))
+          labels_results = sqlcur.fetchall()
+        else:
+          pgcur.execute('SELECT DISTINCT label FROM "%s".labels WHERE message_num = %s', (AsIs("gyb_emails"), AsIs(message_num)))
+          labels_results = pgcur.fetchall()
         for l in labels_results:
           labels.append(l[0])
       if options.label_restored:
@@ -1183,7 +1406,10 @@ def main(argv):
           current, restore_count))
         callGAPI(gbatch, None, soft_errors=True)
         gbatch = googleapiclient.http.BatchHttpRequest()
-        sqlconn.commit()
+        if not options.pg_db:
+          sqlconn.commit()
+        else:
+          pgconn.commit()
         current_batch_bytes = 5000
         largest_in_batch = 0
       gbatch.add(restore_method(userId='me',
@@ -1195,17 +1421,26 @@ def main(argv):
           current, restore_count))
         callGAPI(gbatch, None, soft_errors=True)
         gbatch = googleapiclient.http.BatchHttpRequest()
-        sqlconn.commit()
+        if not options.pg_db:
+          sqlconn.commit()
+        else:
+          pgconn.commit()
         current_batch_bytes = 5000
         largest_in_batch = 0
     if len(gbatch._order) > 0:
       rewrite_line("restoring %s messages (%s/%s)" % (len(gbatch._order),
         current, restore_count))
       callGAPI(gbatch, None, soft_errors=True)
+      if not options.pg_db:
+        sqlconn.commit()
+      else:
+        pgconn.commit()
+    print("\n")    
+    if not options.pg_db:
+      sqlconn.execute('DETACH resume')
       sqlconn.commit()
-    print("\n")
-    sqlconn.execute('DETACH resume')
-    sqlconn.commit()
+    else:
+      pgconn.commit()
 
  # RESTORE-MBOX #
   elif options.action == 'restore-mbox':
@@ -1220,12 +1455,14 @@ def main(argv):
         pass
       except IOError:
         pass
-    sqlcur.execute('ATTACH ? as mbox_resume', (resumedb,))
-    sqlcur.executescript('''CREATE TABLE
+    if not options.pg_db:
+      sqlcur.execute('ATTACH ? as mbox_resume', (resumedb,))
+      sqlcur.executescript('''CREATE TABLE
                         IF NOT EXISTS mbox_resume.restored_messages
                         (message_num TEXT PRIMARY KEY)''')
-    sqlcur.execute('SELECT message_num FROM mbox_resume.restored_messages')
-    messages_to_skip_results = sqlcur.fetchall()
+      sqlcur.execute('SELECT message_num FROM mbox_resume.restored_messages')
+      messages_to_skip_results = sqlcur.fetchall()
+
     messages_to_skip = []
     for a_message in messages_to_skip_results:
       messages_to_skip.append(a_message[0])
@@ -1323,7 +1560,10 @@ def main(argv):
               (len(gbatch._order), current, restore_count))
             callGAPI(gbatch, None, soft_errors=True)
             gbatch = googleapiclient.http.BatchHttpRequest()
-            sqlconn.commit()
+            if not options.pg_db:
+              sqlconn.commit()
+            else:
+              pgconn.commit()
             current_batch_bytes = 5000
             largest_in_batch = 0
           gbatch.add(restore_method(userId='me',
@@ -1336,16 +1576,21 @@ def main(argv):
               (len(gbatch._order), current, restore_count))
             callGAPI(gbatch, None, soft_errors=True)
             gbatch = googleapiclient.http.BatchHttpRequest()
-            sqlconn.commit()
+            if not options.pg_db:
+              sqlconn.commit()
+            else:
+              pgconn.commit()
             current_batch_bytes = 5000
             largest_in_batch = 0
         if len(gbatch._order) > 0:
           rewrite_line("restoring %s messages (%s/%s)" %
             (len(gbatch._order), current, restore_count))
           callGAPI(gbatch, None, soft_errors=True)
-          sqlconn.commit()
-    sqlconn.execute('DETACH mbox_resume')
-    sqlconn.commit()
+          if not options.pg_db:
+            sqlconn.commit()
+    if not options.pg_db:
+      sqlconn.execute('DETACH mbox_resume')
+      sqlconn.commit()
 
   # RESTORE-GROUP #
   elif options.action == 'restore-group':
@@ -1362,17 +1607,25 @@ def main(argv):
         pass
       except IOError:
         pass
-    sqlcur.execute('ATTACH ? as resume', (resumedb,))
-    sqlcur.executescript('''CREATE TABLE IF NOT EXISTS resume.restored_messages
+    if not options.pg_db:
+      sqlcur.execute('ATTACH ? as resume', (resumedb,))
+      sqlcur.executescript('''CREATE TABLE IF NOT EXISTS resume.restored_messages
                       (message_num INTEGER PRIMARY KEY);
-       CREATE TEMP TABLE skip_messages (message_num INTEGER PRIMARY KEY);''')
-    sqlcur.execute('''INSERT INTO skip_messages SELECT message_num
-      FROM restored_messages''')
-    sqlcur.execute('''SELECT message_num, message_internaldate,
-      message_filename FROM messages
+        CREATE TEMP TABLE skip_messages (message_num INTEGER PRIMARY KEY);''')
+      sqlcur.execute('''INSERT INTO skip_messages SELECT message_num
+        FROM restored_messages''')
+      sqlcur.execute('''SELECT message_num, message_internaldate,
+        message_filename FROM messages
           WHERE message_num NOT IN skip_messages
             ORDER BY message_internaldate DESC''')
-    messages_to_restore_results = sqlcur.fetchall()
+      messages_to_restore_results = sqlcur.fetchall()
+    else:
+      pgcur.execute('''CREATE TEMP TABLE skip_messages (message_num INTEGER PRIMARY KEY);''')
+      pgcur.execute('''SELECT message_num, message_internaldate,
+        message_filename FROM "%s".messages
+          WHERE message_num NOT IN skip_messages
+            ORDER BY message_internaldate DESC''',(AsIs("gyb_emails"),))
+      messages_to_restore_results = pgcur.fetchall()
     restore_count = len(messages_to_restore_results)
     current = 0
     for x in messages_to_restore_results:
@@ -1403,9 +1656,11 @@ def main(argv):
       sqlconn.execute(
          'INSERT OR IGNORE INTO restored_messages (message_num) VALUES (?)',
            (message_num,))
+      if not options.pg_db:
+        sqlconn.commit()
+    if not options.pg_db:
+      sqlconn.execute('DETACH resume')
       sqlconn.commit()
-    sqlconn.execute('DETACH resume')
-    sqlconn.commit()
 
   # COUNT 
   elif options.action == 'count':
@@ -1580,8 +1835,12 @@ if __name__ == '__main__':
     main(sys.argv[1:])
   except KeyboardInterrupt:
     try:
-      sqlconn.commit()
-      sqlconn.close()
+      if not options.pg_db:
+        sqlconn.commit()
+        sqlconn.close()
+      else:
+        pgconn.commit()
+        pgconn.close()
       print()
     except NameError:
       pass
